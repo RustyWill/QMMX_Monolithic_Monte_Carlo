@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-# QMMX Monolithic (v6) — Engine + GUI + SQLite + Polygon + Retraining + Chart
+# QMMX Monolithic (v6.1) — Engine + GUI + SQLite + Polygon + Retraining + Chart
 import os, sqlite3, time, threading, json, math, requests, queue
 from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import scrolledtext
+import random
+from statistics import mean, median, pstdev  # if not already there
+from collections import defaultdict, deque
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 from typing import List, Dict, Optional, Tuple, Any
 from q_voice import QVoice
+
+CHART_WORKER_TAG = "CHART_DATA"
 
 # --- tiny helpers used by OnlinePolicy ---
 def _sigmoid(x: float) -> float:
@@ -40,29 +45,6 @@ class _Diag:
 
 diagnostic_monitor = _Diag()
 
-# --- tiny helpers used by OnlinePolicy ---
-def _sigmoid(x: float) -> float:
-    if x < -50:  # clamp to avoid overflow
-        return 0.0
-    if x > 50:
-        return 1.0
-    import math as _m
-    return 1.0 / (1.0 + _m.exp(-x))
-
-def _one_hot(val: str, choices: List[str]) -> List[float]:
-    return [1.0 if val == c else 0.0 for c in choices]
-
-# --- minimal diagnostic monitor shim for monolithic build ---
-class _Diag:
-    def ping(self, component: str) -> None:
-        # No-op; could write to audit() if desired
-        pass
-    def report_error(self, component: str, message: str) -> None:
-        # No-op; could write to audit() if desired
-        pass
-
-diagnostic_monitor = _Diag()
-
 # Optional ML
 try:
     import joblib
@@ -71,7 +53,7 @@ try:
 except Exception:
     SKLEARN_OK = False
 
-APP_NAME = "QMMX Monolithic v6"
+APP_NAME = "QMMX Monolithic v6.1"
 DB_PATH = "qmmx.db"
 
 # ============================
@@ -198,7 +180,7 @@ class PriceFeed:
                 return MarketStatus(False, "unknown")
             j = r.json()
             market = j.get("market","closed")
-            is_open = market in ("open", "extended-hours")
+            is_open = (market == "open") 
             return MarketStatus(is_open, market)
         except Exception:
             return MarketStatus(False, "unknown")
@@ -912,71 +894,70 @@ class ExitStrategy:
             diagnostic_monitor.report_error("exit_planner", f"should_exit() failed: {e}")
             return {"exit": False, "reason": f"exit_planner error: {e}", "basis": None, "level_price": None, "at_price": current_price, "confluence": None}
 
-        def should_escalate_on_target(
-            self,
-            *,
-            open_trade: Dict[str, Any],
-            current_price: float,
-            levels: List[Dict[str, Any]],
-            recent_bars: Optional[List[Tuple[float, float, float]]] = None
-        ) -> Dict[str, Any]:
-            """
-            Called exactly when price is at/near the current target.
-            If momentum/volume favors continuation in the trade direction,
-            propose rolling the target to the next level and trailing the stop.
-            Returns:
-            {
-                "escalate": bool,
-                "next_target": float | None,
-                "trail_stop": float | None,
-                "basis": "continuation" | "reversal" | None,
-                "score": float
-            }
-            """
-            try:
-                # Reuse the main decision to get 'basis' ("continuation" or "reversal")
-                res = self.should_exit(
-                    open_trade=open_trade,
-                    current_price=current_price,
-                    levels=levels,
-                    recent_bars=recent_bars
-                )
-                basis = res.get("basis")
-                if not res.get("exit") and basis == "continuation":
-                    # Determine side
-                    side = open_trade.get("direction") or open_trade.get("side")
-                    side = "long" if str(side).lower() in ("long", "buy") else "short"
+    def should_escalate_on_target(
+        self,
+        *,
+        open_trade: Dict[str, Any],
+        current_price: float,
+        levels: List[Dict[str, Any]],
+        recent_bars: Optional[List[Tuple[float, float, float]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Called exactly when price is at/near the current target.
+        If momentum/volume favors continuation in the trade direction,
+        propose rolling the target to the next level and trailing the stop.
+        Returns:
+        {
+            "escalate": bool,
+            "next_target": float | None,
+            "trail_stop": float | None,
+            "basis": "continuation" | "reversal" | None,
+            "score": float
+        }
+        """
+        try:
+            # Reuse the main decision to get 'basis' ("continuation" or "reversal")
+            res = self.should_exit(
+                open_trade=open_trade,
+                current_price=current_price,
+                levels=levels,
+                recent_bars=recent_bars
+            )
+            basis = res.get("basis")
+            if not res.get("exit") and basis == "continuation":
+                # Determine side
+                side = open_trade.get("direction") or open_trade.get("side")
+                side = "long" if str(side).lower() in ("long", "buy") else "short"
 
-                    # Anchor around the level used by should_exit if provided
-                    anchor_price = float(res.get("level_price") or current_price)
+                # Anchor around the level used by should_exit if provided
+                anchor_price = float(res.get("level_price") or current_price)
 
-                    # Find next level beyond anchor in trade direction
-                    next_target = self._next_level_target(levels, anchor_price, side)
-                    if next_target is None:
-                        return {"escalate": False, "next_target": None, "trail_stop": None, "basis": basis, "score": 0.0}
+                # Find next level beyond anchor in trade direction
+                next_target = self._next_level_target(levels, anchor_price, side)
+                if next_target is None:
+                    return {"escalate": False, "next_target": None, "trail_stop": None, "basis": basis, "score": 0.0}
 
-                    # Trail stop toward breakeven or just beyond the anchor
-                    entry = float(open_trade.get("entry") or open_trade.get("entry_price") or current_price)
-                    if side == "long":
-                        trail = max(entry, anchor_price - self.proximity_window)
-                    else:
-                        trail = min(entry, anchor_price + self.proximity_window)
+                # Trail stop toward breakeven or just beyond the anchor
+                entry = float(open_trade.get("entry") or open_trade.get("entry_price") or current_price)
+                if side == "long":
+                    trail = max(entry, anchor_price - self.proximity_window)
+                else:
+                    trail = min(entry, anchor_price + self.proximity_window)
 
-                    # Crude confidence score: could be replaced with ML later
-                    score = 0.70
-                    return {
-                        "escalate": True,
-                        "next_target": float(next_target),
-                        "trail_stop": float(round(trail, 2)),
-                        "basis": basis,
-                        "score": score
-                    }
+                # Crude confidence score: could be replaced with ML later
+                score = 0.70
+                return {
+                    "escalate": True,
+                    "next_target": float(next_target),
+                    "trail_stop": float(round(trail, 2)),
+                    "basis": basis,
+                    "score": score
+                }
 
-                # Otherwise: do not escalate
-                return {"escalate": False, "next_target": None, "trail_stop": None, "basis": basis, "score": 0.0}
-            except Exception:
-                return {"escalate": False, "next_target": None, "trail_stop": None, "basis": None, "score": 0.0}
-
+            # Otherwise: do not escalate
+            return {"escalate": False, "next_target": None, "trail_stop": None, "basis": basis, "score": 0.0}
+        except Exception:
+            return {"escalate": False, "next_target": None, "trail_stop": None, "basis": None, "score": 0.0}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1127,21 +1108,296 @@ class ExitStrategy:
         else:
             # Up into levels; reversal implies last_price <= second - min_retrace_ticks
             return last_price <= (second - self.min_retrace_ticks)
+
+class LevelTouchMemory:
+    """
+    Tracks touches of your levels inside an accumulation box.
+
+    - Diminishing confidence for repeated touches
+    - Per-level/per-side cooldown
+    - Bounce budget (max attempts)
+    - Edge fatigue detection (many taps toward one edge with rising volume)
+    """
+    def __init__(self,
+                 tol_bps=8,                 # proximity to call a 'touch' (0.08%)
+                 min_time_gap_sec=180,      # don't count touches that are too close in time
+                 min_price_gap_bps=4,       # and not far enough in price from last touch
+                 decay=0.85,                # confidence multiplier per extra touch
+                 max_bounces=2,             # allowed trades per level/side inside same box
+                 fatigue_hits=3,            # taps toward an edge to call it 'fatigued'
+                 fatigue_window_min=30,     # window for counting edge taps
+                 fatigue_vol_k=1.20):       # rising short/long volume ratio to flag fatigue
+        self.tol_bps = tol_bps
+        self.min_time_gap_ms = min_time_gap_sec * 1000
+        self.min_price_gap_bps = min_price_gap_bps
+        self.decay = decay
+        self.max_bounces = max_bounces
+        self.fatigue_hits = fatigue_hits
+        self.fatigue_window_ms = fatigue_window_min * 60 * 1000
+        self.fatigue_vol_k = fatigue_vol_k
+
+        # (level_price_rounded, side) -> dict(count,last_ts,last_price)
+        self.touch = defaultdict(lambda: {"count":0,"last_ts":None,"last_px":None})
+
+        # edge fatigue tracker: keep taps near box edges with volume trend
+        # store deque of (ts_ms, edge, vol_short_over_long)
+        self.edge_taps = deque(maxlen=1000)
+
+    @staticmethod
+    def _bps(px, ref):  # basis points distance
+        return 0.0 if ref <= 0 else abs(px - ref) / ref * 10000.0
+
+    def _roundL(self, L):
+        # reduce floating noise in dict keys
+        return round(float(L), 2)
+
+    def reset_box(self):
+        self.touch.clear()
+        self.edge_taps.clear()
+
+    def register_touch_if_any(self, ts_ms, o, h, l, c, v, levels, price_now, box_low, box_high,
+                              vol_ma_s=None, vol_ma_l=None):
+        """
+        Call on each finished minute bar while you're in 'accumulation'.
+        Detects level touches and logs taps near box edges (for fatigue).
+        """
+        if not levels:
+            return
+
+        # detect any level pierced by this bar
+        for L in levels:
+            Lr = self._roundL(L)
+            # bar pierced or close enough at close
+            near = (l - 1e-9) <= Lr <= (h + 1e-9) or self._bps(c, Lr) <= self.tol_bps
+            if not near:
+                continue
+
+            # pick side by approach (if close below level -> SHORT touch; above -> LONG touch)
+            side = "SHORT" if c > Lr else "LONG"
+            key = (Lr, side)
+            rec = self.touch[key]
+            # de-duplicate noisy rapid re-hits
+            if rec["last_ts"] is not None:
+                if ts_ms - rec["last_ts"] < self.min_time_gap_ms:
+                    continue
+                if rec["last_px"] is not None and self._bps(c, rec["last_px"]) < self.min_price_gap_bps:
+                    continue
+            rec["count"] += 1
+            rec["last_ts"] = ts_ms
+            rec["last_px"] = c
+
+        # edge tap logging for fatigue
+        if box_low is not None and box_high is not None:
+            at_top = h >= (box_high - 1e-9)
+            at_bot = l <= (box_low + 1e-9)
+            ratio = (vol_ma_s / vol_ma_l) if (vol_ma_s and vol_ma_l and vol_ma_l > 0) else 1.0
+            if at_top:
+                self.edge_taps.append((ts_ms, "top", ratio))
+            if at_bot:
+                self.edge_taps.append((ts_ms, "bot", ratio))
+
+    def edge_fatigued(self, now_ms):
+        """
+        Returns 'top' or 'bot' if that edge is fatigued (many taps recently with rising volume).
+        """
+        if not self.edge_taps:
+            return None
+        t0 = now_ms - self.fatigue_window_ms
+        top_hits = [r for (t,e,r) in self.edge_taps if t >= t0 and e == "top"]
+        bot_hits = [r for (t,e,r) in self.edge_taps if t >= t0 and e == "bot"]
+
+        def _is_fatigued(arr):
+            if len(arr) < self.fatigue_hits:
+                return False
+            # require average ratio above threshold to call it 'pressing'
+            avg = sum(arr[-self.fatigue_hits:]) / float(self.fatigue_hits)
+            return avg >= self.fatigue_vol_k
+
+        if _is_fatigued(top_hits):
+            return "top"
+        if _is_fatigued(bot_hits):
+            return "bot"
+        return None
+
+    def allow_trade_at(self, level_price, side, now_ms):
+        """
+        Before placing a bounce trade inside the box, call this.
+        Returns (allowed, reason, conf_multiplier)
+        """
+        key = (self._roundL(level_price), side)
+        rec = self.touch[key]
+        # too many bounces at this level/side?
+        if rec["count"] >= self.max_bounces:
+            return (False, f"Bounce budget exhausted at {key}", 1.0)
+
+        # enforce per-level/per-side cooldown
+        if rec["last_ts"] is not None and now_ms - rec["last_ts"] < self.min_time_gap_ms:
+            return (False, f"Per-level cooldown active at {key}", 1.0)
+
+        # diminishing confidence with each extra touch
+        mult = (self.decay ** max(0, rec["count"] - 0))  # 1st touch count==1 => decay^1 after we record later
+        return (True, "ok", mult)
+
+class AccumulationBreakoutGuard:
+    """
+    Detects accumulation (compressed range), confirms breakout with volume,
+    and exposes a regime that can gate your entries.
+    """
+    def __init__(self,
+                 box_lookback_min=60,       # minutes to form/verify the box
+                 min_bars=30,               # require enough bars to trust the box
+                 compression_bp=18,         # max box height ~<= 0.18% of price
+                 vol_short=5, vol_long=20,  # volume spike = short MA > k * long MA
+                 vol_k=1.40,                # spike multiplier
+                 reenter_clear_bars=3):     # bars back inside box to clear regime
+        self.bars = deque(maxlen=600)  # store (ts_ms, o,h,l,c,v)
+        self.box_lookback_min = box_lookback_min
+        self.min_bars = min_bars
+        self.compression_bp = compression_bp
+        self.vol_short = vol_short
+        self.vol_long = vol_long
+        self.vol_k = vol_k
+        self.reenter_clear_bars = reenter_clear_bars
+
+        self.box_low = None
+        self.box_high = None
+        self.box_ts0 = None
+        self.regime = "unknown"  # unknown|accumulation|breakout_up|breakout_down
+        self._inside_count = 0
+
+    def push_minute_bar(self, ts_ms, o, h, l, c, v):
+        self.bars.append((ts_ms, o, h, l, c, v))
+        self._update_state()
+
+    def _subset_last_minutes(self, minutes):
+        if not self.bars:
+            return []
+        t_end = self.bars[-1][0]
+        lim = minutes * 60 * 1000
+        return [b for b in self.bars if t_end - b[0] <= lim]
+
+    @staticmethod
+    def _ma(vals, n):
+        if n <= 0 or len(vals) < n:
+            return None
+        return sum(vals[-n:]) / float(n)
+
+    def _update_state(self):
+        window = self._subset_last_minutes(self.box_lookback_min)
+        if len(window) < self.min_bars:
+            self.regime = "unknown"
+            self.box_low = self.box_high = self.box_ts0 = None
+            self._inside_count = 0
+            return
+
+        highs = [b[2] for b in window]
+        lows  = [b[3] for b in window]
+        closes = [b[4] for b in window]
+        vols = [b[5] for b in window]
+        price_now = closes[-1]
+
+        box_low = min(lows)
+        box_high = max(highs)
+        box_height = box_high - box_low
+        # compress threshold in price terms (basis points of current price)
+        compress_thresh = price_now * (self.compression_bp / 10000.0)
+
+        vol_ma_s = self._ma(vols, self.vol_short)
+        vol_ma_l = self._ma(vols, self.vol_long)
+
+        # Establish / maintain the accumulation box
+        if box_height <= max(1e-6, compress_thresh):
+            # compressed: in accumulation unless currently in breakout that hasn't failed
+            if self.regime not in ("breakout_up", "breakout_down"):
+                self.regime = "accumulation"
+            self.box_low, self.box_high = box_low, box_high
+            if self.box_ts0 is None:
+                self.box_ts0 = window[0][0]
+        else:
+            # not compressed: keep last box if we had one; else unknown
+            if self.regime not in ("breakout_up", "breakout_down"):
+                self.regime = "unknown"
+
+        # Breakout confirmation with volume spike
+        if self.box_low is not None and self.box_high is not None and vol_ma_s and vol_ma_l:
+            # up breakout: close cleanly above box high AND short vol MA > k * long vol MA
+            if closes[-1] > (self.box_high + 1e-6) and (vol_ma_s > self.vol_k * vol_ma_l):
+                self.regime = "breakout_up"
+                self._inside_count = 0
+            # down breakout
+            elif closes[-1] < (self.box_low - 1e-6) and (vol_ma_s > self.vol_k * vol_ma_l):
+                self.regime = "breakout_down"
+                self._inside_count = 0
+
+        # Regime clear: if after breakout we re-enter box and *stay inside* a few bars
+        if self.regime in ("breakout_up", "breakout_down") and self.box_low is not None:
+            if self.box_low <= closes[-1] <= self.box_high:
+                self._inside_count += 1
+                if self._inside_count >= self.reenter_clear_bars:
+                    self.regime = "accumulation"  # back to box
+            else:
+                self._inside_count = 0
+
+    # --- Public helpers ---
+    def current_box(self):
+        return (self.box_low, self.box_high)
+
+    def allow_trade(self, side):
+        """
+        Gate entries:
+        - In breakout_up: allow LONGs; block SHORTs.
+        - In breakout_down: allow SHORTs; block LONGs.
+        - In accumulation/unknown: allow both (engine's other rules apply).
+        """
+        if self.regime == "breakout_up" and side == "SHORT":
+            return False, "Counter-trend blocked (breakout_up)"
+        if self.regime == "breakout_down" and side == "LONG":
+            return False, "Counter-trend blocked (breakout_down)"
+        return True, self.regime
         
 class MonolithicEngine:
-    def __init__(self, conn, symbol="SPY"):
+    def __init__(self, conn, symbol="SPY", exit_planner=None):
         self.conn = conn
         self.symbol = symbol
         self.state = EngineState()
         self.feed = PriceFeed(symbol)
-        self.CONTACT_PROX = float(settings_get(conn, "CONTACT_PROX", "0.05"))
-        self.Q_MIN_PROB = float(settings_get(conn, "Q_MIN_PROB", "0.60"))
-        self.Q_SIGNAL_COOLDOWN_S = int(settings_get(conn, "Q_SIGNAL_COOLDOWN", "8"))
-        self.REVERSE_TOUCH_DECAY = 0.08
-        self.STOP_PADDING = float(settings_get(conn, "STOP_PADDING", "0.18"))
-        self.TP_PADDING = float(settings_get(conn, "TP_PADDING", "0.25"))
+        self.acc_guard = AccumulationBreakoutGuard()
+
+        # buffers / caches
+        self.recent_bars = []
         self.levels_cache = load_levels(conn)
-        # ML model
+
+        # engine settings
+        self.CONTACT_PROX           = float(settings_get(conn, "CONTACT_PROX", "0.05"))
+        self.Q_SIGNAL_COOLDOWN_S    = int(settings_get(conn, "Q_SIGNAL_COOLDOWN", "8"))
+        self.REVERSE_TOUCH_DECAY    = 0.08
+        self.STOP_PADDING           = float(settings_get(conn, "STOP_PADDING", "0.35"))
+        self.TP_PADDING             = float(settings_get(conn, "TP_PADDING", "0.25"))
+        self._contact_latch = {}   # key -> bool (are we currently “inside” this level’s window?)
+
+
+        # policy switches / thresholds
+        self.ENABLE_VETO            = settings_get(self.conn, "ENABLE_VETO", "1") == "1"
+        self.VETO_VOL_STRONG        = float(settings_get(self.conn, "VETO_VOL_STRONG", "0.25"))
+        self.VETO_PROX              = float(settings_get(self.conn, "VETO_PROX", "0.06"))
+        self.DISABLE_ML_GATE        = settings_get(self.conn, "DISABLE_ML_GATE", "0") == "1"
+
+        # min confidence (accepts 0–1 or 0–100)
+        self.Q_MIN_PROB             = self._read_prob_threshold()
+
+        # use the provided planner or make a default one
+        self.exit_planner = exit_planner or ExitStrategy(
+            proximity_window=0.35,
+            confluence_window=0.6,
+            slight_pierce_fraction=0.12,
+            vol_lookback=5,
+            min_bars_for_trend=3,
+            min_retrace_ticks=0.08
+        )
+
+        self.touchmem = LevelTouchMemory()
+
+        # ML model (leave your existing code as-is)
         self.model = None
         self.model_path = os.path.join(os.path.dirname(__file__), 'models', 'qmmx_lr.joblib')
         if SKLEARN_OK and os.path.exists(self.model_path):
@@ -1149,6 +1405,9 @@ class MonolithicEngine:
                 self.model = joblib.load(self.model_path)
             except Exception:
                 self.model = None
+
+        audit(self.conn, "DEBUG", "GATE_MODE",
+            f"blend={(settings_get(self.conn,'USE_BLEND','0')=='1')}")
 
     def reload_levels(self):
         self.levels_cache = load_levels(self.conn)
@@ -1166,6 +1425,31 @@ class MonolithicEngine:
         if direction in ("up", "down"):
             base += 0.03
         return float(max(0.0, min(1.0, base)))
+    
+    def _read_prob_threshold(self):
+        """
+        Read min confidence from settings. Accepts either 0–1.0 or 0–100.
+        Also supports legacy key 'minp'.
+        """
+        raw = settings_get(self.conn, "Q_MIN_PROB", None)
+        if raw is None:
+            raw = settings_get(self.conn, "minp", "0.60")
+        try:
+            val = float(raw)
+        except Exception:
+            val = 0.60
+        # If someone typed 55 or 60, treat as percent.
+        if val > 1.0:
+            val = val / 100.0
+        # safety clamp
+        if not (0.0 <= val <= 0.99):
+            val = 0.60
+        return val
+
+    def reload_thresholds(self):
+        self.Q_MIN_PROB = self._read_prob_threshold()
+        audit(self.conn, "SETTINGS", "ENGINE_APPLIED", f"Q_MIN_PROB={self.Q_MIN_PROB:.2f}")
+
 
     def _ml_allowed(self, extras):
         if not self.model:
@@ -1180,24 +1464,68 @@ class MonolithicEngine:
             return (proba >= self.Q_MIN_PROB), float(proba)
         except Exception:
             return True, None
+        
+    def _insert_policy_event(self, phase: str, action: str, features: dict, trade_id=None, notes: str = ""):
+        # 1) persist the structured event (unchanged)
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO policy_events(ts, phase, action, features_json, label, trade_id, notes) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (utcnow(), phase, action, json.dumps(features), None, trade_id, notes)
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+
+        # 2) ALSO write a human-readable line to the audit_log (this is what your Log tab shows)
+        try:
+            line = self._format_policy_line(phase, action, features)
+            # 'audit' should already exist in your codebase; it appends to audit_log and UI
+            audit(self.conn, phase.upper(), action.upper(), line, features)
+            # If your UI uses a direct text widget instead of reading the table, also echo out:
+            if hasattr(self, "_log_ui"):
+                self._log_ui(phase.upper(), action.upper(), line)
+        except Exception:
+            pass
 
     def evaluate_entry(self, price_current, prev_price, now_ms, api_key_present):
+        # 0) API key
         if not api_key_present:
+            self._insert_policy_event("entry", "skip", {"reason": "MISSING_API_KEY"})
             return False, MISSING_API_KEY, "No Polygon API key set.", {}
 
+        # 1) Fresh price
         if price_current is None or self.state.last_ts_ms is None or (now_ms - self.state.last_ts_ms) > 15000:
-           return False, PRICE_STALE, "Price None or stale (>15s).", {"last_ts_ms": self.state.last_ts_ms, "now": now_ms}
+            self._insert_policy_event("entry", "skip", {
+                "reason": "PRICE_STALE",
+                "last_ts_ms": self.state.last_ts_ms,
+                "now": now_ms
+            })
+            return False, PRICE_STALE, "Price None or stale (>15s).", {"last_ts_ms": self.state.last_ts_ms, "now": now_ms}
 
+        # 2) Not already in a trade
         if self.state.open_trade_id is not None:
+            self._insert_policy_event("entry", "skip", {
+                "reason": "IN_POSITION",
+                "open_trade_id": self.state.open_trade_id
+            })
             return False, IN_POSITION, "Already in a position.", {"trade_id": self.state.open_trade_id}
 
+        # 3) Cooldown
         if self.state.in_cooldown(now_ms):
+            self._insert_policy_event("entry", "skip", {
+                "reason": "COOLDOWN",
+                "cooldown_until_ms": self.state.cooldown_until_ms
+            })
             return False, COOLDOWN, "Signal cooldown active.", {"until": self.state.cooldown_until_ms}
 
+        # 4) Levels
         if not self.levels_cache:
+            self._insert_policy_event("entry", "skip", {"reason": "NOLEVELS"})
             return False, NOLEVELS, "No levels loaded.", {}
 
-        # ---- Direction from prev -> current (with tiny epsilon + fallback to last known) ----
+        # 5) Direction from prev -> current
         EPS = 1e-9
         direction = None
         if prev_price is not None:
@@ -1207,73 +1535,383 @@ class MonolithicEngine:
                 direction = "down"
             else:
                 direction = self.state.last_direction  # reuse last non-flat direction
-
         if direction is None:
+            self._insert_policy_event("entry", "skip", {"reason": "DIR_UNKNOWN"})
             return False, DIR_UNKNOWN, "Flat tick; cannot infer approach.", {}
 
-        # Nearest level and distance using current price
+        # 6) Nearest level & distance
         nearest = min(self.levels_cache, key=lambda L: abs(L["price"] - price_current))
         dist = abs(nearest["price"] - price_current)
         if dist > self.CONTACT_PROX:
+            self._insert_policy_event("entry", "skip", {
+                "reason": "TOO_FAR",
+                "level_price": float(nearest["price"]),
+                "proximity_abs": float(dist),
+                "CONTACT_PROX": float(self.CONTACT_PROX),
+            })
             return False, TOO_FAR, (
                 f"Nearest level {nearest['color']}/{nearest['type']}[{nearest['index']}] "
                 f"@{nearest['price']:.2f} too far ({dist:.2f})."
             ), {"dist": dist}
 
-        # Record contact event with the same 'direction' as 'approach'
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO contact_events(ts, symbol, level_color, level_type, level_index, level_price, approach, reaction, distance) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (utcnow(), self.symbol, nearest['color'], nearest['type'], nearest['index'],
-             nearest['price'], direction, 'contact', dist)
-        )
-        self.conn.commit()
-
-        # Confidence, touches, etc.
+        # 7) Touch count: increment once per contact (even if we don't trade)
         key = (nearest["color"], nearest["type"], nearest["index"])
-        touch_count = self.state.level_touch_counts.get(key, 0) + 1
+        inside = (dist <= self.CONTACT_PROX)
+
+        # latch logic to avoid incrementing every tick while hovering
+        latched = self._contact_latch.get(key, False)
+        if inside and not latched:
+            # first tick of a NEW touch
+            self.state.level_touch_counts[key] = self.state.level_touch_counts.get(key, 0) + 1
+            self._contact_latch[key] = True
+        elif not inside and latched:
+            # we left the window → release
+            self._contact_latch[key] = False
+
+        # also release latches for other levels we've drifted away from
+        for L in (self.levels_cache or []):
+            k_other = (L["color"], L["type"], L["index"])
+            if k_other != key and self._contact_latch.get(k_other):
+                if abs(float(L["price"]) - float(price_current)) > self.CONTACT_PROX:
+                    self._contact_latch[k_other] = False
+
+        touch_count = self.state.level_touch_counts.get(key, 0)
         if touch_count >= 4:
-            return False, LEVEL_OVERTOUCHED, f"Level over-touched (#{touch_count}).", {"level": key, "touch_count": touch_count}
+            self._insert_policy_event("entry", "skip", {
+                "reason": "LEVEL_OVERTOUCHED",
+                "level": list(key),
+                "touch_count": int(touch_count),
+            })
+            return False, LEVEL_OVERTOUCHED, f"Level over-touched (#{touch_count}).", {
+                "level": key, "touch_count": touch_count
+            }
+        
+                # ---- LevelTouchMemory gate for accumulation bounces (before #8 Confidence) ----
+        touch_decay_mult = 1.0
+        if getattr(self, "acc_guard", None) and self.acc_guard.regime == "accumulation":
+            # Decide which edge we’re interacting with based on approach direction
+            # (SHORTs are top-edge bounces; LONGs are bottom-edge bounces)
+            edge_for_this = "top" if direction == "down" else "bot"
 
-        conf = self.compute_confidence(nearest, price_current, direction, touch_count)
-        if conf < self.Q_MIN_PROB:
-            return False, CONF_LOW, (
-                f"Confidence {conf:.2f} < min {self.Q_MIN_PROB:.2f}."
-            ), {"level": key, "level_price": nearest["price"], "conf": conf, "touch_count": touch_count, "dir": direction}
+            # 3a) Edge fatigue: if the edge is being pressed with rising volume, block bounces there
+            fatigued = self.touchmem.edge_fatigued(now_ms)
+            if fatigued == edge_for_this:
+                self._insert_policy_event("entry", "skip", {
+                    "reason": "EDGE_FATIGUE",
+                    "edge": fatigued,
+                    "level_price": float(nearest["price"])
+                })
+                return False, VETO, f"Edge fatigue blocks {('SHORT' if direction=='down' else 'LONG')} bounce", {}
 
+            # 3b) Per-level budget/cooldown and diminishing confidence
+            ok_touch, why, mult = self.touchmem.allow_trade_at(
+                level_price=nearest["price"],
+                side=("SHORT" if direction == "down" else "LONG"),
+                now_ms=now_ms
+            )
+            if not ok_touch:
+                self._insert_policy_event("entry", "skip", {
+                    "reason": why,
+                    "level_price": float(nearest["price"])
+                })
+                return False, VETO, why, {}
+
+            touch_decay_mult = float(mult)
+        else:
+            touch_decay_mult = 1.0
+
+        # (place this just above "# 8) Confidence")
+        qmin = float(self.Q_MIN_PROB or 0.0)
+
+        # 8) Confidence (your handcrafted conf before ML)
+        conf = self.compute_confidence(nearest, price_current, direction, touch_count) * touch_decay_mult
+        if conf < qmin:
+            self._insert_policy_event("entry", "skip", {
+                "reason": "CONF_LOW",
+                "conf": float(conf),
+                "Q_MIN_PROB": float(qmin),
+                "level_price": float(nearest["price"]),
+                "proximity_abs": float(dist),
+                "approach": ("from_below" if direction == "up" else "from_above"),
+                "touch_count": int(touch_count),
+            })
+            return False, CONF_LOW, f"Confidence {conf:.2f} < min {qmin:.2f}.", {
+                "level": key, "level_price": nearest["price"], "conf": conf,
+                "touch_count": touch_count, "dir": direction
+            }
+
+        # 9) Side + risk scaffold (stop/target derived from level)
         extras = {
             "side": ("long" if direction == "up" else "short"),
             "level": key,
-            "level_price": nearest["price"],
-            "conf": conf,
-            "touch_count": touch_count,
+            "level_price": float(nearest["price"]),
+            "conf": float(conf),
+            "touch_count": int(touch_count),
             "direction": direction
         }
+        # --- Accumulation/Breakout regime gate (blocks counter-trend after a volume-confirmed break) ---
+        if getattr(self, "acc_guard", None):
+            intended = "LONG" if extras["side"] == "long" else "SHORT"
+            ok_gate, why = self.acc_guard.allow_trade(intended)
+            if not ok_gate:
+                # optional: structured breadcrumb for your Log tab
+                self._insert_policy_event("entry", "policy_skip", {
+                    "reason": "ACC_BREAKOUT_GATE",
+                    "detail": why,
+                    "level_price": float(extras["level_price"]),
+                    "side": extras["side"],
+                    "conf": float(extras.get("conf", 0.0)),
+                    "touch_count": int(extras.get("touch_count", 0)),
+                })
+                return False, 904, why, {**extras}
+        # ------------------------------------------------------------------
 
         if extras["side"] == "long":
-            stop = nearest["price"] - float(settings_get(self.conn, "STOP_PADDING", "0.18"))
+            stop = nearest["price"] - float(settings_get(self.conn, "STOP_PADDING", "0.35"))
             target = nearest["price"] + float(settings_get(self.conn, "TP_PADDING", "0.25"))
         else:
-            stop = nearest["price"] + float(settings_get(self.conn, "STOP_PADDING", "0.18"))
+            stop = nearest["price"] + float(settings_get(self.conn, "STOP_PADDING", "0.35"))
             target = nearest["price"] - float(settings_get(self.conn, "TP_PADDING", "0.25"))
-        extras["stop"], extras["target"] = stop, target
+        extras["stop"], extras["target"] = float(stop), float(target)
 
-        ok_ml, prob = self._ml_allowed(extras)
-        if not ok_ml:
-            return False, CONF_LOW, f"ML prob {prob:.2f} < min {self.Q_MIN_PROB:.2f}", {**extras, "ml_prob": prob}
-        if prob is not None:
-            extras["ml_prob"] = prob
+        # 10) Behavioral veto (soft; defaults to ALLOW unless strong contradictory evidence)
+        if self.ENABLE_VETO:
+            approach     = "from_below" if direction == "up" else "from_above"
+            volume_slope = self._calc_volume_slope(getattr(self, "recent_bars", []), window=6)
+            confluence   = self._has_confluence_near(nearest["price"], within=0.15)
+
+            allowed, veto_code, _ = self._soft_veto(
+                side=extras["side"],
+                price=float(price_current),
+                level_price=float(nearest["price"]),
+                volume_slope=float(volume_slope),
+                approach=approach,
+                confluence=bool(confluence),
+                proximity_abs=float(dist),
+                slight_pierce_window=(getattr(self, "CONTACT_PROX", 0.1) * 0.12),
+            )
+            if not allowed:
+                self._insert_policy_event("entry", "policy_skip", {
+                    "reason": veto_code,
+                    "prox": float(dist),
+                    "vol_slope": float(volume_slope),
+                    "confluence": bool(confluence),
+                    "approach": approach,
+                    "level_price": float(nearest["price"]),
+                    "side": extras["side"],
+                    "conf": float(extras["conf"]),
+                    "touch_count": int(extras["touch_count"]),
+                })
+                return False, VETO, f"Veto {veto_code}", {**extras, "veto": veto_code}
+
+        # 11) ML / blended gate (respects kill-switch)
+        # decide mode: AND (hard gate) vs blended (70/30)
+        use_blend = getattr(self, "USE_BLEND_OVERRIDE", None)
+        if use_blend is None:
+            use_blend = (settings_get(self.conn, "USE_BLEND", "0") == "1")
+
+        # weights (default 70/30), normalized just in case
+        w_rules = float(settings_get(self.conn, "W_RULES", "0.7") or 0.7)
+        w_ml    = float(settings_get(self.conn, "W_ML", "0.3") or 0.3)
+        s = w_rules + w_ml
+        if s <= 0:
+            w_rules, w_ml, s = 1.0, 0.0, 1.0
+        w_rules, w_ml = w_rules / s, w_ml / s
+
+        mlp = None
+        ok_ml = True
+
+        if not self.DISABLE_ML_GATE:
+            ok_ml, prob = self._ml_allowed(extras)
+            mlp = float(prob) if prob is not None else float(conf)
+        else:
+            mlp = float(extras.get("ml_prob", extras.get("conf", conf)))
+
+        if use_blend:
+            blended = float(w_rules) * float(conf) + float(w_ml) * float(mlp)
+            if blended < qmin:
+                self._insert_policy_event("entry", "skip", {
+                    "reason": "COMBINED_LOW",
+                    "conf": float(conf),
+                    "ml_prob": float(mlp),
+                    "blended": float(blended),
+                    "Q_MIN_PROB": float(qmin),
+                })
+                return False, CONF_LOW, f"Blended {blended:.2f} < min {qmin:.2f}", {**extras, "ml_prob": mlp, "blended": blended}
+            extras["ml_prob"] = float(mlp)
+            extras["blended"] = float(blended)
+        else:
+            # classic AND: require ML to pass too (unless ML gate is disabled)
+            if not self.DISABLE_ML_GATE and not ok_ml:
+                self._insert_policy_event("entry", "skip", {
+                    "reason": "ML_CONF_LOW",
+                    "ml_prob": float(mlp),
+                    "Q_MIN_PROB": float(qmin),
+                    "level_price": float(nearest["price"]),
+                    "proximity_abs": float(dist),
+                    "approach": ("from_below" if direction == "up" else "from_above"),
+                    "touch_count": int(touch_count),
+                })
+                return False, CONF_LOW, f"ML prob {mlp:.2f} < min {qmin:.2f}", {**extras, "ml_prob": mlp}
+            extras["ml_prob"] = float(mlp)
+
+        # 12) Pre-open policy event so open_trade() can attach it
+        try:
+            feats = {
+                "proximity_abs": float(abs(extras["level_price"] - float(price_current))),
+                "approach": ("from_below" if direction == "up" else "from_above"),
+                "touch_count": int(extras["touch_count"]),
+                "conf": float(extras["conf"]),
+                "ml_prob": float(extras.get("ml_prob", extras["conf"])),
+            }
+            self._insert_policy_event("entry", f"go_{extras['side']}", feats, trade_id=None, notes="PRE_OPEN")
+        except Exception:
+            pass
 
         return True, OK, "Entry allowed.", extras
+    
+    def _soft_veto(self, *, side, price, level_price, volume_slope, approach, confluence, proximity_abs, slight_pierce_window):
+        # If we have little evidence, do NOT veto.
+        if abs(volume_slope) < 0.05 and not confluence:
+            return True, "INCONCLUSIVE", {"note": "weak evidence"}
+
+        # Your rule-of-thumb:
+        # - Approaching a level: decreasing volume ⇒ reversal; increasing volume ⇒ penetration.
+        # - Only veto when the chosen side contradicts the likely behavior AND we are very near the level.
+        strong = self.VETO_VOL_STRONG
+        near   = proximity_abs <= max(self.VETO_PROX, slight_pierce_window)
+
+        if approach == "from_below":
+            # Up towards resistance
+            if near and side == "long"  and volume_slope < -strong: return False, "CONTRA_VOL_LONG",  {}
+            if near and side == "short" and volume_slope >  strong: return False, "CONTRA_VOL_SHORT", {}
+        else:
+            # Down towards support
+            if near and side == "long"  and volume_slope >  strong: return False, "CONTRA_VOL_LONG",  {}
+            if near and side == "short" and volume_slope < -strong: return False, "CONTRA_VOL_SHORT", {}
+
+        # Confluence is a weak nudge toward continuation; never a hard veto by itself.
+        return True, "ALLOW", {}
+
+    def _calc_volume_slope(self, bars, window=6):
+        if not bars or len(bars) < 3:
+            return 0.0
+
+        def _vol(b):
+            # Try multiple common keys; default to 0 if absent
+            return (b.get("v") or b.get("volume") or b.get("V") or 0.0)
+
+        last = bars[-min(window, len(bars)):]
+        vols = [float(_vol(b)) for b in last]
+        half = max(2, len(vols) // 2)
+        v1 = sum(vols[:half]) / half
+        v2 = sum(vols[-half:]) / half
+        if v1 == 0 and v2 == 0:
+            return 0.0
+        return (v2 - v1) / (abs(v1) + 1e-9)
+
+    def _on_minute_close(self, ts_ms, o, h, l, c, v):
+        """
+        Call this once per finished 1-min bar.
+        - Keeps a small bar buffer
+        - Feeds the Accumulation guard (if you added it)
+        - Registers level touches while in accumulation
+        """
+        # keep a compact (price, volume, ts) history for other features
+        self.recent_bars.append({"price": float(c), "volume": float(v), "ts": int(ts_ms)})
+        if len(self.recent_bars) > 240:  # ~ last 4 hours
+            self.recent_bars = self.recent_bars[-240:]
+
+        # simple volume MAs from recent_bars (5/20)
+        vols = [float(b.get("volume", 0.0)) for b in self.recent_bars]
+        vol_ma_s = (sum(vols[-5:]) / max(1, min(5, len(vols)))) if vols else 0.0
+        vol_ma_l = (sum(vols[-20:]) / max(1, min(20, len(vols)))) if vols else 0.0
+
+        # If you added AccumulationBreakoutGuard elsewhere, feed it:
+        if getattr(self, "acc_guard", None):
+            try:
+                self.acc_guard.push_minute_bar(ts_ms, o, h, l, c, v)
+            except Exception:
+                pass
+
+        # While in accumulation, record touches & edge taps
+        if getattr(self, "acc_guard", None) and self.acc_guard.regime == "accumulation":
+            box_low, box_high = self.acc_guard.current_box()
+            try:
+                self.touchmem.register_touch_if_any(
+                    ts_ms, o, h, l, c, v,
+                    levels=self.levels_cache,
+                    price_now=c,
+                    box_low=box_low,
+                    box_high=box_high,
+                    vol_ma_s=vol_ma_s,
+                    vol_ma_l=vol_ma_l
+                )
+            except Exception:
+                pass
+
+        # If we’ve flipped into a breakout regime, clear per-box touch memory
+        if getattr(self, "acc_guard", None) and self.acc_guard.regime in ("breakout_up", "breakout_down"):
+            self.touchmem.reset_box()
+
+    def ingest_tick(self, ts_ms: int, price: float, volume: float = 0.0):
+        """
+        Feed every tick/price update here.
+        Rolls a 1-minute OHLCV bar and calls _on_minute_close(...) when the minute ends.
+        """
+        m = int(ts_ms // 60000)  # minute bucket
+        cur = getattr(self, "_cur_bar", None)
+
+        if cur is None or cur["m"] != m:
+            # finalize previous bar
+            if cur is not None:
+                self._on_minute_close(
+                    cur["ts0_ms"], cur["o"], cur["h"], cur["l"], cur["c"], cur["v"]
+                )
+            # start new bar
+            self._cur_bar = {
+                "m": m,
+                "ts0_ms": (ts_ms - (ts_ms % 60000)),  # minute start
+                "o": float(price), "h": float(price), "l": float(price), "c": float(price),
+                "v": float(volume or 0.0),
+            }
+        else:
+            # update current bar
+            cur["c"] = float(price)
+            if price > cur["h"]: cur["h"] = float(price)
+            if price < cur["l"]: cur["l"] = float(price)
+            cur["v"] += float(volume or 0.0)
+
+    def _has_confluence_near(self, target_price, within=0.15):
+        return sum(1 for L in self.levels_cache if abs(L["price"] - target_price) <= within) >= 2
 
     def open_trade(self, side, entry, stop, target, reason_open):
         cur = self.conn.cursor()
-        cur.execute("INSERT INTO trades(ts_open, symbol, side, entry, stop, target, reason_open) VALUES(?,?,?,?,?,?,?)",
-                    (utcnow(), self.symbol, side, entry, stop, target, reason_open))
+        cur.execute(
+            "INSERT INTO trades(ts_open, symbol, side, entry, stop, target, reason_open) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (utcnow(), self.symbol, side, entry, stop, target, reason_open)
+        )
         self.conn.commit()
         trade_id = cur.lastrowid
         self.state.open_trade_id = trade_id
+
+        # Attach most recent unlabeled entry policy_event to this trade
+        try:
+            cur.execute("""
+                UPDATE policy_events
+                SET trade_id = ?
+                WHERE id = (
+                    SELECT id FROM policy_events
+                    WHERE phase='entry' AND trade_id IS NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+            """, (trade_id,))
+            self.conn.commit()
+        except Exception:
+            pass
+
         return trade_id
 
     def close_trade(self, trade_id, exit_price, reason_close):
@@ -1382,19 +2020,27 @@ class QMMXApp(tk.Tk):
         super().__init__()
         self.title(APP_NAME)
         self.geometry("1180x800")
+
+        # 1) DB and QVoice first
         self.conn = db_connect()
         db_init(self.conn)
-        self.qvoice = QVoice(DB_PATH)  # DB-only; UI gets attached in _build_ui
+        self.qvoice = QVoice(DB_PATH)  # ok to init early
 
-        # state
+        self.trade_filters = {
+            "symbol": "",
+            "side": "",        # "long"/"short" or ""
+            "date_from": "",   # text, e.g. "2025-08-20"
+            "date_to": "",     # text
+        }
+
+        # 2) Plain-Python attributes BEFORE engine
         self.symbol = settings_get(self.conn, "symbol", "SPY")
         self.api_key = settings_get(self.conn, "polygon_api_key", "")
         self.allow_ah = settings_get(self.conn, "allow_after_hours", "0") == "1"
         self.chart_candles = int(settings_get(self.conn, "chart_candles", "120") or 120)
-                # Starting balance (persisted in settings)
         self.starting_balance = float(settings_get(self.conn, "portfolio_start", "10000") or 10000.0)
-        self.engine = MonolithicEngine(self.conn, symbol=self.symbol)
-                # Strategies & learner
+
+        # 3) Build planners/policy
         self.policy = OnlinePolicy(lr=0.03, l2=1e-6, use_perceptron=False)
         self.entry_planner = SmartEntryPlanner(
             proximity_window=0.35, confluence_window=0.6,
@@ -1402,26 +2048,294 @@ class QMMXApp(tk.Tk):
             min_bars_for_trend=3, min_retrace_ticks=0.08,
             entry_slippage=0.03, freshness_seconds=180
         )
+        self._load_policy()
+
         self.exit_planner = ExitStrategy(
             proximity_window=0.35, confluence_window=0.6,
             slight_pierce_fraction=0.12, vol_lookback=5,
             min_bars_for_trend=3, min_retrace_ticks=0.08
         )
+
+        # 4) NOW build the engine and pass the planner + symbol
+        self.engine = MonolithicEngine(self.conn, symbol=self.symbol, exit_planner=self.exit_planner)
+
+        # 5) UI, threads, timers
+        self.log_text = None
         self.engine_thread = None
         self.running = False
         self.ui_queue = queue.Queue()
-
         self._build_ui()
         self._load_levels_into_ui()
         self._start_price_loop()
         self._schedule_price_ping()
         self._start_retrain_scheduler()
         self._refresh_portfolio_ui()
+        self._trade_artists = []   # matplotlib artists we add for trades
+
+        audit(
+            self.conn, "DEBUG", "GATES",
+            (
+                f"policy={(settings_get(self.conn,'DISABLE_POLICY_GATE','0')!='1')} "
+                f"veto={self.engine.ENABLE_VETO} "
+                f"ml={not self.engine.DISABLE_ML_GATE} "
+                f"prox={self.engine.CONTACT_PROX} "
+                f"stop={self.engine.STOP_PADDING} "
+                f"tp={self.engine.TP_PADDING} "
+                f"blend={(settings_get(self.conn,'USE_BLEND','0')=='1')} "
+                f"w_rules={settings_get(self.conn,'W_RULES','0.7')} "
+                f"w_ml={settings_get(self.conn,'W_ML','0.3')}"
+            )
+        )
+
+        # === Policy persistence ===
+    def _policy_store_path(self) -> str:
+        models_dir = os.path.join(os.path.dirname(__file__), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        return os.path.join(models_dir, "online_policy.joblib")
+
+    def _load_policy(self):
+        try:
+            path = self._policy_store_path()
+            if os.path.exists(path):
+                obj = joblib.load(path)
+                # Expected: {"w_entry": {...}, "w_exit": {...}, "dim": int, "cfg": {...}}
+                self.policy.w_entry = obj.get("w_entry", self.policy.w_entry)
+                self.policy.w_exit  = obj.get("w_exit",  self.policy.w_exit)
+                self.policy._dim    = obj.get("dim",     self.policy._dim)
+                cfg = obj.get("cfg", {})
+                self.policy.lr = cfg.get("lr", self.policy.lr)
+                self.policy.l2 = cfg.get("l2", self.policy.l2)
+                self.policy.use_perceptron = cfg.get("use_perceptron", self.policy.use_perceptron)
+                self._log_ui("POLICY", "LOAD", f"Loaded OnlinePolicy from {os.path.basename(path)}")
+        except Exception as e:
+            self._log_ui("POLICY", "LOAD_ERR", f"Failed loading OnlinePolicy: {e}")
+
+    def _save_policy(self):
+        try:
+            path = self._policy_store_path()
+            payload = {
+                "w_entry": self.policy.w_entry,
+                "w_exit":  self.policy.w_exit,
+                "dim":     self.policy._dim,
+                "cfg": {"lr": self.policy.lr, "l2": self.policy.l2, "use_perceptron": self.policy.use_perceptron}
+            }
+            joblib.dump(payload, path)
+            self._log_ui("POLICY", "SAVE", f"Saved OnlinePolicy → {os.path.basename(path)}")
+        except Exception as e:
+            self._log_ui("POLICY", "SAVE_ERR", f"Failed saving OnlinePolicy: {e}")
+
+    def _insert_policy_event(self, phase: str, action: str, features: dict, trade_id=None, notes: str = ""):
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO policy_events(ts, phase, action, features_json, label, trade_id, notes) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (utcnow(), phase, action, json.dumps(features), None, trade_id, notes)
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+        # Mirror a readable line into the audit log (what the Log tab shows)
+        try:
+            line = self._format_policy_line(phase, action, features)
+            audit(self.conn, phase.upper(), action.upper(), line, features)
+            if hasattr(self, "_log_ui"):  # if you also buffer text to a widget
+                self._log_ui(phase.upper(), action.upper(), line)
+        except Exception:
+            pass
+
+    def _format_policy_line(self, phase: str, action: str, f: dict) -> str:
+        reason      = str(f.get("reason", action)).upper()
+        conf        = f.get("conf");     minp   = f.get("Q_MIN_PROB") or f.get("min")
+        prox        = f.get("prox") or f.get("proximity_abs")
+        level_price = f.get("level_price")
+        approach    = f.get("approach"); touch  = f.get("touch_count")
+        vol_slope   = f.get("vol_slope") or f.get("volume_trend")
+        confl       = f.get("confluence"); mlp  = f.get("ml_prob")
+
+        parts = [reason]
+        if conf is not None and minp is not None: parts.append(f"conf={float(conf):.2f} < min={float(minp):.2f}")
+        if prox is not None:        parts.append(f"prox={float(prox):.03f}")
+        if level_price is not None: parts.append(f"lvl={float(level_price):.2f}")
+        if approach:                parts.append(f"appr={approach}")
+        if touch is not None:       parts.append(f"touch#{int(touch)}")
+        if vol_slope is not None:   parts.append(f"volSlope={float(vol_slope):+.2f}")
+        if confl is not None:       parts.append(f"confL={bool(confl)}")
+        if mlp is not None:         parts.append(f"ml={float(mlp):.2f}")
+        return " | ".join(parts)
+    
+    def _build_trades_tab(self, frame):
+        # -- Filter bar --
+        top = ttk.Frame(frame); top.pack(fill=tk.X, pady=6)
+
+        ttk.Label(top, text="Symbol").pack(side=tk.LEFT, padx=(0,4))
+        self.trf_symbol = ttk.Entry(top, width=8)
+        self.trf_symbol.insert(0, self.trade_filters.get("symbol","") or self.symbol)
+        self.trf_symbol.pack(side=tk.LEFT)
+
+        ttk.Label(top, text="Side").pack(side=tk.LEFT, padx=(10,4))
+        self.trf_side = ttk.Combobox(top, state="readonly", width=7,
+                                    values=["(any)", "long", "short"])
+        self.trf_side.set("(any)")
+        self.trf_side.pack(side=tk.LEFT)
+
+        ttk.Label(top, text="From").pack(side=tk.LEFT, padx=(10,4))
+        self.trf_from = ttk.Entry(top, width=12)
+        self.trf_from.insert(0, "")
+        self.trf_from.pack(side=tk.LEFT)
+
+        ttk.Label(top, text="To").pack(side=tk.LEFT, padx=(10,4))
+        self.trf_to = ttk.Entry(top, width=12)
+        self.trf_to.insert(0, "")
+        self.trf_to.pack(side=tk.LEFT)
+
+        ttk.Button(top, text="Apply", command=self._apply_trades_filters).pack(side=tk.LEFT, padx=(10,4))
+        ttk.Button(top, text="Reset", command=self._reset_trades_filters).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Export CSV", command=self._export_trades_csv).pack(side=tk.LEFT, padx=(10,4))
+
+        # -- Table --
+        cols = ("id","open","close","symbol","side","entry","exit","stop","target","R","PnL","reason_open","reason_close")
+        tv = ttk.Treeview(frame, columns=cols, show="headings", height=20)
+        self.trades_tv = tv
+        for c in cols:
+            tv.heading(c, text=c)
+            tv.column(c, width=90 if c not in ("reason_open","reason_close") else 160, anchor="w")
+
+        # row colors
+        tv.tag_configure("win",  background="#eaffea")  # light green
+        tv.tag_configure("loss", background="#ffecec")  # light red
+        tv.tag_configure("open", background="#eef3ff")  # faint blue for open trades
+
+        tv.pack(fill=tk.BOTH, expand=True)
+
+        legend = ttk.Frame(frame); legend.pack(anchor="w", pady=4)
+        ttk.Label(legend, text="Legend: ").pack(side=tk.LEFT)
+        lbl_w = ttk.Label(legend, text="WIN", background="#eaffea"); lbl_w.pack(side=tk.LEFT, padx=4)
+        lbl_l = ttk.Label(legend, text="LOSS", background="#ffecec"); lbl_l.pack(side=tk.LEFT, padx=4)
+        lbl_o = ttk.Label(legend, text="OPEN", background="#eef3ff"); lbl_o.pack(side=tk.LEFT, padx=4)
+
+        # enter key on fields applies
+        for w in (self.trf_symbol, self.trf_from, self.trf_to):
+            w.bind("<Return>", lambda e: self._apply_trades_filters())
+        self.trf_side.bind("<<ComboboxSelected>>", lambda e: self._apply_trades_filters())
+
+        self._refresh_trades_tab()
+
+    def _apply_trades_filters(self):
+        self.trade_filters["symbol"]    = self.trf_symbol.get().strip()
+        self.trade_filters["side"]      = "" if self.trf_side.get()=="(any)" else self.trf_side.get()
+        self.trade_filters["date_from"] = self.trf_from.get().strip()
+        self.trade_filters["date_to"]   = self.trf_to.get().strip()
+        self._refresh_trades_tab()
+
+    def _reset_trades_filters(self):
+        self.trf_symbol.delete(0, "end"); self.trf_symbol.insert(0, self.symbol)
+        self.trf_side.set("(any)")
+        self.trf_from.delete(0, "end"); self.trf_to.delete(0, "end")
+        self.trade_filters.update({"symbol": self.symbol, "side":"", "date_from":"", "date_to":""})
+        self._refresh_trades_tab()
+
+    def _refresh_trades_tab(self):
+        tv = getattr(self, "trades_tv", None)
+        if not tv: return
+        for r in tv.get_children():
+            tv.delete(r)
+
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, ts_open, ts_close, symbol, side, entry, exit, stop, target, reason_open, reason_close
+            FROM trades
+            ORDER BY id DESC
+            LIMIT 1000
+        """)
+        rows = cur.fetchall()
+
+        # parse helpers
+        def parse_dt(s):
+            if not s: return None
+            try:
+                dt = datetime.fromisoformat(str(s).replace("Z",""))
+                return dt
+            except Exception:
+                return None
+
+        def signed_R(side, entry, exit_px, stop):
+            if exit_px is None or stop is None: return None
+            risk = max(1e-9, abs(float(entry)-float(stop)))
+            raw = (float(exit_px) - float(entry)) / risk
+            return raw if str(side).lower()=="long" else -raw
+
+        def pnl_usd(side, entry, exit_px):
+            if exit_px is None: return None
+            units = 1.0
+            diff = (float(exit_px) - float(entry)) * (1.0 if str(side).lower()=="long" else -1.0)
+            return diff * units
+
+        # read filters
+        f_symbol = (self.trade_filters.get("symbol") or "").upper()
+        f_side   = (self.trade_filters.get("side") or "").lower()
+        df_txt   = self.trade_filters.get("date_from") or ""
+        dt_txt   = self.trade_filters.get("date_to") or ""
+        df_dt    = parse_dt(df_txt) if df_txt else None
+        dt_dt    = parse_dt(dt_txt) if dt_txt else None
+
+        # filter + insert
+        for (tid, o, c, sym, side, entry, exit_px, stop, target, ro, rc) in rows:
+            # filters
+            if f_symbol and sym and f_symbol not in str(sym).upper(): 
+                continue
+            if f_side and str(side).lower()!=f_side:
+                continue
+            o_dt = parse_dt(o); c_dt = parse_dt(c)
+            # date filter checks: if close exists use close; else use open
+            key_dt = c_dt or o_dt
+            if df_dt and key_dt and key_dt < df_dt: 
+                continue
+            if dt_dt and key_dt and key_dt > dt_dt: 
+                continue
+
+            R = signed_R(side, entry, exit_px, stop)
+            pnl = pnl_usd(side, entry, exit_px)
+
+            tag = ()
+            if exit_px is None:
+                tag = ("open",)
+            elif R is not None and R >= 0:
+                tag = ("win",)
+            elif R is not None and R < 0:
+                tag = ("loss",)
+
+            tv.insert("", "end", values=(
+                tid, o or "", c or "", sym or "", side or "",
+                f"{float(entry):.2f}" if entry is not None else "",
+                f"{float(exit_px):.2f}" if exit_px is not None else "",
+                f"{float(stop):.2f}" if stop is not None else "",
+                f"{float(target):.2f}" if target is not None else "",
+                f"{R:+.2f}" if R is not None else "",
+                f"{pnl:+.2f}" if pnl is not None else "",
+                ro or "", rc or ""
+            ), tags=tag)
+
+    def _export_trades_csv(self):
+        import csv, os
+        path = os.path.join(os.path.dirname(__file__), "trades_export.csv")
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, ts_open, ts_close, symbol, side, entry, exit, stop, target, reason_open, reason_close
+            FROM trades ORDER BY id
+        """)
+        rows = cur.fetchall()
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["id","ts_open","ts_close","symbol","side","entry","exit","stop","target","reason_open","reason_close"])
+            for r in rows: w.writerow(r)
+        messagebox.showinfo("Export", f"Saved {len(rows)} rows to {path}")
 
     # ---------- UI Construction ----------
     def _build_ui(self):
         nb = ttk.Notebook(self)
         nb.pack(fill=tk.BOTH, expand=True)
+        self.notebook = nb
 
         # Live
         self.live_frame = ttk.Frame(nb, padding=10)
@@ -1468,6 +2382,11 @@ class QMMXApp(tk.Tk):
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
+        #Trades
+        self.trades_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.trades_frame, text="Trades")
+        self._build_trades_tab(self.trades_frame)
+
     # ---------- Charting ----------
     def _build_chart(self, parent):
         self.figure = plt.Figure(figsize=(9.2, 3.3), dpi=100)
@@ -1492,26 +2411,93 @@ class QMMXApp(tk.Tk):
         api_key = self.api_key or settings_get(self.conn, "polygon_api_key", "")
         if not api_key:
             return
-        bars, err = self.engine.feed.get_minute_bars(api_key, minutes=self.chart_candles)
-        if err or not bars:
-            self.ax.clear()
-            self.ax.set_title(f"{self.symbol} — no bars yet")
-            self.canvas.draw_idle()
+
+        # prevent overlapping fetches
+        if getattr(self, "_chart_busy", False):
             return
+        self._chart_busy = True
+
+        def worker():
+            try:
+                bars, err = self.engine.feed.get_minute_bars(api_key, minutes=self.chart_candles)
+                try:
+                    levels = load_levels(self.conn)  # DB off UI thread too
+                except Exception:
+                    levels = []
+
+                if bars:
+                    # make volume slope available to the engine
+                    self.engine.recent_bars = list(bars[-180:])
+
+                # hand off to UI thread
+                self.ui_queue.put((CHART_WORKER_TAG, {"bars": bars, "levels": levels, "err": err}))
+            finally:
+                # release busy flag on UI thread
+                self.after(0, lambda: setattr(self, "_chart_busy", False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mpl_color(self, c):
+        """Map DB color strings/tuples to Matplotlib-friendly colors."""
+        if not c:
+            return "#2c82c9"
+        if isinstance(c, str):
+            c = c.strip()
+            if c.startswith("#"):
+                return c  # already a hex
+            M = {
+                "blue":"#1f77b4","b":"#1f77b4",
+                "cyan":"#17becf","c":"#17becf","teal":"#20b2aa",
+                "green":"#2ca02c","g":"#2ca02c",
+                "red":"#d62728","r":"#d62728","magenta":"#e377c2","m":"#e377c2",
+                "purple":"#9467bd","p":"#9467bd",
+                "orange":"#ff7f0e","o":"#ff7f0e","gold":"#f0b400","yellow":"#f6c343","y":"#f6c343",
+                "gray":"#7f7f7f","grey":"#7f7f7f","black":"#000000","k":"#000000","white":"#ffffff","w":"#ffffff",
+            }
+            return M.get(c.lower(), c)  # fall back to whatever it is
+        if isinstance(c, (tuple, list)) and len(c) == 3:
+            # Allow (R,G,B) in 0–255 or 0–1
+            return tuple(v/255.0 for v in c) if max(c) > 1 else tuple(c)
+        return "#2c82c9"
+
+    def _render_chart_payload(self, payload):
+        bars = payload.get("bars") or []
+        err  = payload.get("err")
+        levels = payload.get("levels") or []
 
         ax = self.ax
         ax.clear()
+
+        if err or not bars:
+            ax.set_title(f"{self.symbol} — no bars yet")
+            self.canvas.draw_idle()
+            return
+
+        # candles
         for i, b in enumerate(bars):
             o, h, l, c = b["o"], b["h"], b["l"], b["c"]
             ax.plot([i, i], [l, h])  # wick
             bottom = min(o, c)
             height = abs(c - o) if abs(c - o) > 1e-9 else 0.0001
-            ax.add_patch(plt.Rectangle((i-0.3, bottom), 0.6, height, fill=True))
+            ax.add_patch(plt.Rectangle((i - 0.3, bottom), 0.6, height, fill=True))
 
+        # levels (from worker)
         for lv in load_levels(self.conn):
-            ax.axhline(lv["price"], linestyle="--" if lv["type"] == "dashed" else "-", linewidth=1)
+            color = self._mpl_color(lv.get("color"))
+            ls    = "--" if lv.get("type") == "dashed" else "-"
+            self.ax.axhline(
+                float(lv["price"]),
+                linestyle=ls,
+                linewidth=1.6,
+                color=color,         # <- explicit color
+                alpha=0.95,
+                zorder=15            # draw above candles
+            )
 
-        # Determine Y-axis bounds based on recent bars (with a small margin)
+        # NEW: overlay trade markers on top of candles
+        self._draw_trade_markers(self.ax, bars)
+
+        # y-bounds w/ margin
         prices = [b["o"] for b in bars] + [b["c"] for b in bars] + [b["h"] for b in bars] + [b["l"] for b in bars]
         pmin, pmax = min(prices), max(prices)
         margin = (pmax - pmin) * 0.05 if pmax > pmin else 1.0
@@ -1521,13 +2507,121 @@ class QMMXApp(tk.Tk):
         ax.set_title(f"{self.symbol} — last {len(bars)} minutes")
         ax.set_xlabel("minute bars (most recent on right)")
         ax.set_ylabel("price")
+        self.figure.autofmt_xdate()
         self.figure.tight_layout()
         self.canvas.draw_idle()
+    
+    def _draw_trade_markers(self, ax, bars):
+        # (a) optionally clear previous artists if you’re tracking them
+        for a in getattr(self, "_trade_artists", []):
+            try: a.remove()
+            except: pass
+        self._trade_artists = []
 
-        ax.set_xlabel("minute bars (most recent on right)")
-        ax.set_ylabel("price")
-        self.figure.tight_layout()
-        self.canvas.draw_idle()
+        # (b) fetch recent trades
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, ts_open, ts_close, symbol, side, entry, exit, stop, target
+            FROM trades
+            WHERE symbol=?
+            ORDER BY id DESC LIMIT 300
+        """, (self.symbol,))
+        rows = cur.fetchall()
+
+        # (c) map trade timestamps → bar indices
+        def _parse_ts_ms(ts):
+            if not ts: return None
+            from datetime import datetime, timezone
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z",""))
+                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp()*1000)
+            except: return None
+
+        def bar_ts(b):
+            t = b.get("t") or b.get("ts")
+            if isinstance(t, (int,float)): return int(t)
+            if isinstance(t, str):
+                try: return _parse_ts_ms(t)
+                except: return None
+            return None
+
+        bar_times = [bar_ts(b) for b in bars]
+
+        def idx_for(ts_ms):
+            if ts_ms is None: return None
+            # nearest by absolute diff if timestamps exist
+            if any(bt is not None for bt in bar_times):
+                best_i, best_d = None, float("inf")
+                for i, bt in enumerate(bar_times):
+                    if bt is None: continue
+                    d = abs(bt - ts_ms)
+                    if d < best_d: best_d, best_i = d, i
+                return best_i
+            # fallback: right edge
+            return len(bars)-1
+
+        # (d) draw
+        for (tid, ts_o, ts_c, sym, side, entry, exit_px, stop, target) in rows:
+            io = idx_for(_parse_ts_ms(ts_o))
+            ic = idx_for(_parse_ts_ms(ts_c)) if ts_c else None
+
+            # entry marker
+            if entry is not None and io is not None:
+                m = "^" if str(side).lower()=="long" else "v"
+                art = ax.scatter([io], [float(entry)], marker=m, s=60, zorder=5)
+                self._trade_artists.append(art)
+                txt = ax.text(io, float(entry), f"#{tid}", fontsize=7, va="bottom", ha="left", alpha=0.7)
+                self._trade_artists.append(txt)
+
+            # stop/target short guides
+            if io is not None and stop is not None:
+                h = ax.hlines(float(stop), max(0, io-5), min(len(bars)-1, (ic or io)+5),
+                            linestyles="dotted", linewidth=0.8, alpha=0.6)
+                self._trade_artists.append(h)
+            if io is not None and target is not None:
+                h = ax.hlines(float(target), max(0, io-5), min(len(bars)-1, (ic or io)+5),
+                            linestyles="dotted", linewidth=0.8, alpha=0.6)
+                self._trade_artists.append(h)
+
+            # exit + connector
+            if exit_px is not None and ic is not None and io is not None:
+                e = ax.scatter([ic], [float(exit_px)], marker="o", s=36, zorder=5)
+                self._trade_artists.append(e)
+                line, = ax.plot([io, ic], [float(entry), float(exit_px)], linestyle=":", linewidth=1.0, alpha=0.8)
+                self._trade_artists.append(line)
+
+    def _parse_ts_ms(self, ts_text):
+        """Accepts 'YYYY-MM-DD HH:MM:SS' or ISO-like; returns epoch ms (int) or None."""
+        try:
+            # stored via utcnow(); usually naive UTC
+            dt = datetime.fromisoformat(ts_text.replace("Z", ""))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+    
+    def _nearest_bar_index(self, bars, ts_ms):
+        if ts_ms is None:
+            return None
+        # polygon/your feed usually has 't' (ms) or 'ts' (ms)
+        arr = [b.get("t") or b.get("ts") for b in bars]
+        if not arr or any(v is None for v in arr):
+            return None
+        # binary-ish search
+        lo, hi = 0, len(arr)-1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if arr[mid] < ts_ms:
+                lo = mid + 1
+            else:
+                hi = mid
+        # choose closer of lo and lo-1
+        best = lo
+        if lo > 0 and abs(arr[lo-1]-ts_ms) < abs(arr[lo]-ts_ms):
+            best = lo-1
+        return best
 
     # ---------- Live Tab ----------
     def _build_live_tab(self, frame):
@@ -1550,6 +2644,23 @@ class QMMXApp(tk.Tk):
         btn_row.pack(fill=tk.X, pady=(0,6))
         ttk.Button(btn_row, text="Start Engine", command=self.start_engine).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="Stop Engine", command=self.stop_engine).pack(side=tk.LEFT, padx=6)
+       # add the Sim button to the same row as Start/Stop (btn_row uses pack)
+        ttk.Button(
+            btn_row,
+            text="Sim last bars",
+            command=lambda:self.simulate_last_bars(n=self.chart_candles, touch_limit=1, with_gates=True)
+
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Sim last bars (gated)",
+           command=lambda: self.simulate_last_bars(n=self.chart_candles,
+                                                   touch_limit=1,
+                                                   with_gates=True)
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row,
+             text="Monte Carlo",
+             command=lambda: self.simulate_monte_carlo(n=self.chart_candles, touch_limit=1, trials=500, with_gates=True)
+        ).pack(side=tk.LEFT, padx=6)
 
         chart_frame = ttk.LabelFrame(frame, text="Candles (1-min, configurable)")
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=6)
@@ -1789,6 +2900,7 @@ class QMMXApp(tk.Tk):
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set("Engine stopped.")
+        self._save_policy()
 
     def _engine_loop(self):
         last_levels_reload = 0
@@ -1802,7 +2914,7 @@ class QMMXApp(tk.Tk):
                     continue
 
                 status = self.engine.feed.get_market_status(api_key)
-                market_open = status.is_open or self.allow_ah
+                market_open = (status.session == "open") or (self.allow_ah and status.session == "extended-hours")
 
                 if market_open:
                     price, t_ms, err = self.engine.feed.get_last_trade(api_key)
@@ -1814,6 +2926,19 @@ class QMMXApp(tk.Tk):
 
                     prev_price = self.engine.state.last_price
                     now_ms = int(time.time() * 1000)
+
+                    # INSERT ↓↓↓
+                    volume_current = 0.0
+                    self.engine.ingest_tick(int(t_ms), float(price), float(volume_current))
+                    # INSERT ↑↑↑
+
+                    # Evaluate using prev -> current BEFORE updating state
+                    ok, code, msg, extras = self.engine.evaluate_entry(
+                        price_current=price,
+                        prev_price=prev_price,
+                        now_ms=now_ms,
+                        api_key_present=bool(api_key)
+                    )
 
                     # Evaluate using prev -> current BEFORE updating state
                     ok, code, msg, extras = self.engine.evaluate_entry(
@@ -1838,13 +2963,17 @@ class QMMXApp(tk.Tk):
                     time.sleep(2.0)
                     continue
 
-
                 if self.engine.state.open_trade_id is not None:
                     cur = self.conn.cursor()
                     cur.execute("SELECT side, stop, target FROM trades WHERE id=?", (self.engine.state.open_trade_id,))
                     row = cur.fetchone()
+                    # --- FIX: Fetch recent bars before checking for escalation ---
+                    # Fetch the last ~10 minutes of bar data to analyze momentum.
+                    recent_bars, _ = self.engine.feed.get_minute_bars(self.api_key, minutes=10)
+                    # --- END FIX ---
                     if row:
                         side, stop, target = row
+
                         if side == "long":
                             if price <= stop:
                                 self.engine.close_trade(self.engine.state.open_trade_id, price, "STOP")
@@ -1852,22 +2981,18 @@ class QMMXApp(tk.Tk):
                                 self._log_ui("EXIT", "STOP", f"Stop hit @ {price:.2f}")
                                 self.engine.state.set_cooldown(now_ms, self.engine.Q_SIGNAL_COOLDOWN_S)
                                 self._refresh_portfolio_ui()
-                        elif price >= target:
-                            # Try escalation instead of auto-close
-                            escalated, meta = self.maybe_escalate_on_target(price, recent_bars)
-                            if escalated:
-                                # Escalated to the next level; keep the trade open and continue managing
-                                return
-                            # Otherwise, book the win as usual
-                            self.close_trade(self.state.open_trade_id, price, "TARGET")
-                            try:
-                                audit(self.conn, "EXIT", "TARGET", f"Target hit at {price:.2f}", {})
-                                self._log_ui("EXIT", "TARGET", f"Target hit @ {price:.2f}")
-                            except Exception:
-                                pass
-                            self.state.set_cooldown(now_ms, self.Q_SIGNAL_COOLDOWN_S)
-                            # (refresh any UI/portfolio display you maintain)
-                            return
+                                continue  # move to next loop tick
+
+                            elif price >= target:
+                                # Try escalation; if it doesn't escalate, book the win
+                                escalated, meta = self.engine.maybe_escalate_on_target(price, recent_bars)
+                                if not escalated:
+                                    self.engine.close_trade(self.engine.state.open_trade_id, price, "TARGET")
+                                    audit(self.conn, "EXIT", "TARGET", f"Target hit at {price:.2f}", {})
+                                    self._log_ui("EXIT", "TARGET", f"Target hit @ {price:.2f}")
+                                    self.engine.state.set_cooldown(now_ms, self.engine.Q_SIGNAL_COOLDOWN_S)
+                                    self._refresh_portfolio_ui()
+                                continue
 
                         elif side == "short":
                             if price >= stop:
@@ -1876,22 +3001,17 @@ class QMMXApp(tk.Tk):
                                 self._log_ui("EXIT", "STOP", f"Stop hit @ {price:.2f}")
                                 self.engine.state.set_cooldown(now_ms, self.engine.Q_SIGNAL_COOLDOWN_S)
                                 self._refresh_portfolio_ui()
-                        elif price >= target:
-                            # Try escalation instead of auto-close
-                            escalated, meta = self.maybe_escalate_on_target(price, recent_bars)
-                            if escalated:
-                                # Escalated to the next level; keep the trade open and continue managing
-                                return
-                            # Otherwise, book the win as usual
-                            self.close_trade(self.state.open_trade_id, price, "TARGET")
-                            try:
-                                audit(self.conn, "EXIT", "TARGET", f"Target hit at {price:.2f}", {})
-                                self._log_ui("EXIT", "TARGET", f"Target hit @ {price:.2f}")
-                            except Exception:
-                                pass
-                            self.state.set_cooldown(now_ms, self.Q_SIGNAL_COOLDOWN_S)
-                            # (refresh any UI/portfolio display you maintain)
-                            return
+                                continue
+
+                            elif price <= target:
+                                escalated, meta = self.engine.maybe_escalate_on_target(price, recent_bars)
+                                if not escalated:
+                                    self.engine.close_trade(self.engine.state.open_trade_id, price, "TARGET")
+                                    audit(self.conn, "EXIT", "TARGET", f"Target hit at {price:.2f}", {})
+                                    self._log_ui("EXIT", "TARGET", f"Target hit @ {price:.2f}")
+                                    self.engine.state.set_cooldown(now_ms, self.engine.Q_SIGNAL_COOLDOWN_S)
+                                    self._refresh_portfolio_ui()
+                                continue
 
                     self._refresh_position_ui()
                 else:
@@ -1964,7 +3084,29 @@ class QMMXApp(tk.Tk):
                                 chosen = "go_long" if side == "long" else "go_short"
                                 pass_gate = (scores.get(chosen, 0.5) >= 0.60) and (scores.get("skip", 0.0) < 0.55)
                             else:
-                                x, scores, pass_gate = None, {}, True
+                                x, scores, pass_gate = None, {}, False
+                            
+                            # Toggle to bypass the UI policy gate (defaults to ON/bypass so you can trade)
+                            disable_policy_gate = settings_get(self.conn, "DISABLE_POLICY_GATE", "0") == "1"
+
+                            if disable_policy_gate:
+                                pass_gate = True
+
+                            if not pass_gate:
+                                # Log a structured policy_skip so it shows up with details
+                                self.engine._insert_policy_event("entry", "policy_skip", {
+                                    "reason": "ONLINE_POLICY",
+                                    "prox": float(proximity_abs),
+                                    "level_price": float(lvl_price),
+                                    "side": side,
+                                    "approach": approach,
+                                    "scores": {k: round(v, 3) for k, v in (scores or {}).items()},
+                                    "conf": float(extras.get("conf", 0.0)),
+                                    "touch_count": int(extras.get("touch_count", 1)),
+                                })
+                                self._log_ui("ENTRY", "POLICY_SKIP",
+                                            f"ONLINE_POLICY veto {side.upper()} @ {price:.2f} (lvl {lvl_price:.2f})")
+                                continue  # do not try to open the trade
 
                             if pass_gate:
                                 tid = self.engine.open_trade(
@@ -2010,15 +3152,8 @@ class QMMXApp(tk.Tk):
                                     pass
 
                                 key = tuple(extras["level"])
-                                self.engine.state.level_touch_counts[key] = self.engine.state.level_touch_counts.get(key, 0) + 1
                                 self._refresh_position_ui()
-                            else:
-                                # Policy vetoed this entry
-                                audit(self.conn, "ENTRY", "POLICY_SKIP",
-                                      f"Policy gated entry {side} @ {price:.2f} near {lvl_price:.2f}",
-                                      {"scores": scores, "proximity": proximity_abs, "mins_since_open": mins_open})
-                                self._log_ui("ENTRY", "POLICY_SKIP",
-                                             f"VETO {side.upper()} @ {price:.2f} (near {lvl_price:.2f})")
+
                         except Exception as ex:
                             # Fallback to original open so we don't halt trading
                             try:
@@ -2030,7 +3165,6 @@ class QMMXApp(tk.Tk):
                                     f"{extras['side'].upper()} @ {price:.2f} | stop {extras['stop']:.2f} | target {extras['target']:.2f}"
                                 )
                                 key = tuple(extras["level"])
-                                self.engine.state.level_touch_counts[key] = self.engine.state.level_touch_counts.get(key, 0) + 1
                                 self._refresh_position_ui()
                             except Exception as ex2:
                                 audit(self.conn, "ENTRY", "OPEN_ERR", f"{ex2}", {"price": price, **extras})
@@ -2067,13 +3201,14 @@ class QMMXApp(tk.Tk):
     def _drain_ui_queue(self):
         try:
             while True:
-                item = self.ui_queue.get_nowait()
-                if item[0] == "price":
-                    self.price_var.set(f"{item[1]:.2f}")
+                kind, payload = self.ui_queue.get_nowait()
+                if kind == CHART_WORKER_TAG:
+                    self._render_chart_payload(payload)
+                # ...handle other kinds...
         except queue.Empty:
             pass
-        self.after(200, self._drain_ui_queue)
-        self._refresh_portfolio_ui()
+        finally:
+            self.after(200, self._drain_ui_queue)
 
     def _refresh_position_ui(self):
         cur = self.conn.cursor()
@@ -2166,21 +3301,402 @@ class QMMXApp(tk.Tk):
         self.port_equity.set(f"{snap['equity']:.2f}")
         self.port_wins.set(str(wins or 0))
         self.port_losses.set(str(losses or 0))
-          
 
-    def _log_ui(self, phase, code, message):
-        audit(self.conn, phase, code, message, {})
-        self.log_text.configure(state=tk.NORMAL)
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"{ts} | {phase:<7} | {code:<14} | {message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+    def _log_ui(self, topic: str, code: str, message: str, extra: dict | None = None):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {topic}:{code} — {message}"
+
+        # Avoid Tk __getattr__ surprises: grab the attribute directly from __dict__
+        widget = getattr(self, "log_text", None)
+
+        # If UI isn't ready or widget isn't a Text, print to stdout and bail
+        try:
+            import tkinter as tk  # local import to avoid circulars in some layouts
+            if widget is None or not isinstance(widget, tk.Text):
+                try:
+                    print(line)
+                    if extra:
+                        import json
+                        print(json.dumps(extra, indent=2))
+                except Exception:
+                    pass
+                return
+        except Exception:
+            # Even importing tk failed? just print
+            try:
+                print(line)
+            except Exception:
+                pass
+            return
+
+        # Safe UI write
+        try:
+            widget.configure(state=tk.NORMAL)
+            widget.insert(tk.END, line + "\n")
+            if extra:
+                import json
+                widget.insert(tk.END, json.dumps(extra, indent=2) + "\n")
+            widget.see(tk.END)
+            widget.configure(state=tk.DISABLED)
+        except Exception:
+            try:
+                print(line)
+            except Exception:
+                pass
 
     def on_close(self):
         self.stop_engine()
         try: self.conn.close()
         except: pass
         self.destroy()
+
+    def simulate_monte_carlo(self, n=600, touch_limit=1, trials=500, with_gates=True,
+                         entry_slip_std=0.01, level_jitter_std=0.02,
+                         stop_slip_std=0.00, target_slip_std=0.00, seed=None):
+        """
+        Monte Carlo robustness test on last N minute bars.
+        - Uses your current levels, pads (STOP/TP), CONTACT_PROX, and (optionally) gates.
+        - Adds realistic noise: entry slippage, level jitter (affects stop/target), optional stop/TP slip.
+        - If both stop and target sit inside the same bar, resolves with a distance-weighted coin flip.
+        Reports: Total R distribution, VaR(5%), CVaR(5%), worst drawdown, win/loss/open counts (mean).
+        """
+        try:
+            import time
+            from statistics import mean, median, pstdev
+            if seed is not None:
+                random.seed(seed)
+
+            # ---------- Pull data & knobs ----------
+            bars   = list(getattr(self.engine, "recent_bars", []))[-n:]
+            levels = list(getattr(self.engine, "levels_cache", []))
+            if not bars or not levels:
+                messagebox.showinfo("Monte Carlo", "Need bars and levels. Refresh the chart, then try again.")
+                return
+
+            prox = float(self.engine.CONTACT_PROX)
+            sp   = float(self.engine.STOP_PADDING)
+            tp   = float(self.engine.TP_PADDING)
+
+            # ---------- Build candidate signals (same detector as your sim) ----------
+            def nearest_level(px: float) -> float:
+                L = min(levels, key=lambda lv: abs(float(lv["price"]) - px))
+                return float(L["price"])
+
+            candidates = []
+            touch_counts = {}
+            prev_c = None
+
+            # use the real engine gate if requested (exactly like live)
+            save_override = getattr(self.engine, "USE_BLEND_OVERRIDE", None)
+            # leave blend/AND mode to whatever your engine is set to globally
+            try:
+                for i, b in enumerate(bars):
+                    o, h, l, c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+                    if prev_c is None:
+                        prev_c = c
+                        continue
+
+                    lvl = nearest_level(c)
+                    proximity_abs = abs(lvl - c)
+                    if proximity_abs > prox:
+                        prev_c = c
+                        continue
+
+                    side = "long" if c > prev_c else "short"
+
+                    k = round(lvl, 4)
+                    tc = touch_counts.get(k, 0) + 1
+                    if tc > touch_limit:
+                        prev_c = c
+                        continue
+                    touch_counts[k] = tc
+
+                    # Optionally apply the full gate stack
+                    if with_gates:
+                        now_ms = int(time.time() * 1000) + i * 60_000
+                        self.engine.state.last_ts_ms = now_ms  # ensure "fresh"
+                        allowed, code, reason, extras = self.engine.evaluate_entry(
+                            price_current=c, prev_price=prev_c, now_ms=now_ms, api_key_present=True
+                        )
+                        if not allowed:
+                            prev_c = c
+                            continue
+                        # Use engine's scaffold for stop/target if available
+                        lvl = float(extras.get("level_price", lvl))
+                        side = extras.get("side", side)
+
+                    # Risk scaffold off the (possibly updated) level
+                    if side == "long":
+                        stop   = lvl - sp
+                        target = lvl + tp
+                    else:
+                        stop   = lvl + sp
+                        target = lvl - tp
+
+                    candidates.append({
+                        "i": i, "side": side, "lvl": float(lvl),
+                        "entry": float(c), "stop": float(stop), "target": float(target)
+                    })
+                    prev_c = c
+            finally:
+                self.engine.USE_BLEND_OVERRIDE = save_override
+
+            if not candidates:
+                messagebox.showinfo("Monte Carlo", "No candidates found with current settings.")
+                return
+
+            # ---------- Run trials ----------
+            def walk_outcome(cand, rand):
+                """Simulate one trade outcome with noisy params; return (R, outcome)."""
+                side = cand["side"]
+                # jitter the level and (optionally) stop/target and entry
+                lvl_j = cand["lvl"] + rand.gauss(0.0, level_jitter_std)
+                entry = cand["entry"] + rand.gauss(0.0, entry_slip_std)
+
+                if side == "long":
+                    stop   = lvl_j - sp + rand.gauss(0.0, stop_slip_std)
+                    target = lvl_j + tp + rand.gauss(0.0, target_slip_std)
+                else:
+                    stop   = lvl_j + sp + rand.gauss(0.0, stop_slip_std)
+                    target = lvl_j - tp + rand.gauss(0.0, target_slip_std)
+
+                risk   = abs(entry - stop) or 1e-9
+                reward = abs(target - entry)
+
+                # walk forward bars to see hit order
+                for j in range(cand["i"] + 1, len(bars)):
+                    hh, ll = float(bars[j]["h"]), float(bars[j]["l"])
+                    stop_hit   = (ll <= stop) if side == "long" else (hh >= stop)
+                    target_hit = (hh >= target) if side == "long" else (ll <= target)
+
+                    if stop_hit and target_hit:
+                        # distance-weighted coin flip for tie (who is "closer" to entry intrabar)
+                        up_span   = max(0.0, hh - entry)
+                        down_span = max(0.0, entry - ll)
+                        p_target_first = up_span / (up_span + down_span + 1e-9)
+                        if rand.random() < p_target_first:
+                            return (reward / risk, "tp")
+                        else:
+                            return (-1.0, "stop")
+                    elif target_hit:
+                        return (reward / risk, "tp")
+                    elif stop_hit:
+                        return (-1.0, "stop")
+
+                return (0.0, "open")
+
+            totals, worst_dds, win_counts, loss_counts, open_counts = [], [], [], [], []
+            rng = random.Random(seed)  # independent RNG
+
+            for t in range(trials):
+                eq = 0.0
+                peak = 0.0
+                max_dd = 0.0
+                wins = losses = opens = 0
+
+                for cand in candidates:
+                    r, outcome = walk_outcome(cand, rng)
+                    eq += r
+                    peak = max(peak, eq)
+                    max_dd = min(max_dd, eq - peak)  # negative number
+                    if outcome == "tp":   wins += 1
+                    elif outcome == "stop": losses += 1
+                    else:                 opens += 1
+
+                totals.append(eq)
+                worst_dds.append(max_dd)
+                win_counts.append(wins)
+                loss_counts.append(losses)
+                open_counts.append(opens)
+
+            # ---------- Summarize ----------
+            totals_sorted = sorted(totals)
+            p05_idx = max(0, int(0.05 * len(totals_sorted)) - 1)
+            var_05  = totals_sorted[p05_idx] if totals_sorted else 0.0
+            cvar_05 = mean(totals_sorted[:p05_idx+1]) if p05_idx >= 0 else 0.0
+
+            msg = (
+                f"Candidates: {len(candidates)} | Trials: {trials}\n"
+                f"Total R — mean {mean(totals):+.2f}, median {median(totals):+.2f}, "
+                f"stdev {pstdev(totals):.2f}\n"
+                f"Best {max(totals):+.2f} | Worst {min(totals):+.2f}\n"
+                f"VaR(5%) {var_05:+.2f} | CVaR(5%) {cvar_05:+.2f}\n"
+                f"Max drawdown (R) — mean {mean(worst_dds):+.2f}, worst {min(worst_dds):+.2f}\n"
+                f"Avg counts — wins {mean(win_counts):.1f}, losses {mean(loss_counts):.1f}, open {mean(open_counts):.1f}"
+            )
+            audit(self.conn, "MC", "SUMMARY", msg)
+            self._log_ui("MC", "SUMMARY", msg)
+            messagebox.showinfo("Monte Carlo", msg)
+
+        except Exception as e:
+            import traceback
+            audit(self.conn, "MC", "ERROR", str(e))
+            audit(self.conn, "MC", "ERROR_TRACE", traceback.format_exc())
+            try:
+                messagebox.showerror("Monte Carlo error", str(e))
+            except Exception:
+                pass
+
+    def simulate_last_bars(self, n=1200, touch_limit=2, with_gates=False,
+                       policy_min=0.60, policy_skip_max=0.55):
+        """
+        What-if sim on the last N minute bars already in memory (self.engine.recent_bars)
+        using current levels and the engine's STOP/TP paddings.
+        Reports wins/losses, Total/Avg R, and Max Profit/Loss.
+        """
+        try:
+            bars = list(getattr(self.engine, "recent_bars", []))[-n:]
+            levels = list(getattr(self.engine, "levels_cache", []))
+            if not bars or not levels:
+                messagebox.showinfo("Sim", "Need bars and levels first. Refresh the chart, then try again.")
+                return
+
+            prox = float(self.engine.CONTACT_PROX)
+            sp   = float(self.engine.STOP_PADDING)
+            tp   = float(self.engine.TP_PADDING)
+
+            touch_counts = {}
+            trades = []
+
+            def nearest_level(px: float) -> float:
+                L = min(levels, key=lambda lv: abs(float(lv["price"]) - px))
+                return float(L["price"])
+
+            prev_c = None
+            for i, b in enumerate(bars):
+                o, h, l, c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+                if prev_c is None:
+                    prev_c = c
+                    continue
+
+                lvl = nearest_level(c)
+                proximity_abs = abs(lvl - c)
+                if proximity_abs > prox:
+                    prev_c = c
+                    continue
+
+                # side by approach (same as engine)
+                side = "long" if c > prev_c else "short"
+
+                # ---------- GATES (use the engine's real gate) ----------
+                if with_gates:
+                    # fabricate a fresh timestamp so the "PRICE_STALE" check passes
+                    now_ms = int(time.time() * 1000) + i * 60_000
+                    self.engine.state.last_ts_ms = now_ms  # make price "fresh"
+
+                    # Run the real gate (policy + veto + ML) exactly like live
+                    allowed, code, reason, details = self.engine.evaluate_entry(
+                        price_current=c,
+                        prev_price=prev_c,
+                        now_ms=now_ms,
+                        api_key_present=True,   # ok for sim
+                    )
+                    if not allowed:
+                        # helpful breadcrumb in the Log tab
+                        audit(self.conn, "SIM", f"GATE_SKIP:{code}",
+                            f"{reason} prox={abs(lvl - c):.03f}")
+                        prev_c = c
+                        continue
+                # --------------------------------------------------------
+                        
+                k = round(lvl, 4)
+                tc = touch_counts.get(k, 0) + 1
+                if tc > touch_limit:
+                    prev_c = c
+                    continue
+                touch_counts[k] = tc
+
+                # risk scaffold off the level
+                if side == "long":
+                    stop   = lvl - sp
+                    target = lvl + tp
+                else:
+                    stop   = lvl + sp
+                    target = lvl - tp
+
+                entry = c
+
+                # walk forward to see which hits first
+                hit = None
+                for j in range(i + 1, len(bars)):
+                    hh, ll = float(bars[j]["h"]), float(bars[j]["l"])
+                    if side == "long":
+                        if ll <= stop:   hit = ("stop", j); break
+                        if hh >= target: hit = ("tp",   j); break
+                    else:
+                        if hh >= stop:   hit = ("stop", j); break
+                        if ll <= target: hit = ("tp",   j); break
+
+                if hit is None:
+                    outcome = "open"
+                    exit_px = float(bars[-1]["c"])
+                    r = 0.0
+                else:
+                    outcome = hit[0]
+                    exit_px = target if outcome == "tp" else stop
+                    risk    = abs(entry - stop) or 1e-9
+                    reward  = abs(target - entry)
+                    r       = (reward / risk) if outcome == "tp" else -1.0
+
+                trades.append({
+                    "i": i, "side": side, "lvl": round(lvl, 2),
+                    "entry": round(entry, 2), "stop": round(stop, 2), "target": round(target, 2),
+                    "exit": round(exit_px, 2), "outcome": outcome, "R": round(r, 2),
+                    "prox": round(proximity_abs, 3), "touch#": tc
+                })
+
+                prev_c = c
+
+            # -------- summarize --------
+            wins  = sum(1 for t in trades if t["outcome"] == "tp")
+            loss  = sum(1 for t in trades if t["outcome"] == "stop")
+            openx = sum(1 for t in trades if t["outcome"] == "open")
+
+            closed  = [t for t in trades if t["outcome"] in ("tp", "stop")]
+            total_R = round(sum(t["R"] for t in trades), 2)
+            avg_R   = round(sum(t["R"] for t in closed) / max(1, len(closed)), 2)
+
+            def signed_pnl_usd(t):
+                sgn = 1.0 if t["side"] == "long" else -1.0
+                return (t["exit"] - t["entry"]) * sgn  # $/share
+
+            max_win_R      = round(max((t["R"] for t in closed), default=0.0), 2)
+            max_loss_R     = round(min((t["R"] for t in closed), default=0.0), 2)
+            max_profit_usd = round(max((signed_pnl_usd(t) for t in closed), default=0.0), 2)
+            max_loss_usd   = round(min((signed_pnl_usd(t) for t in closed), default=0.0), 2)
+
+            # Log + popup
+            audit(self.conn, "SIM", "SUMMARY",
+                f"N={n} | trades={len(trades)} | wins={wins} loss={loss} open={openx} | "
+                f"total_R={total_R} avg_R(closed)={avg_R} | "
+                f"max_win_R={max_win_R} max_loss_R={max_loss_R} | "
+                f"max_profit=${max_profit_usd} max_loss=${max_loss_usd} | "
+                f"prox={prox} stop={sp} tp={tp}")
+
+            for t in trades:
+                pnl_usd = signed_pnl_usd(t)
+                audit(self.conn, "SIM", "TRADE",
+                    f"{t['outcome'].upper():5s} | {t['side']:5s} @ {t['entry']:.2f} → {t['exit']:.2f} "
+                    f"| lvl {t['lvl']:.2f} | R={t['R']:+.2f} | ${pnl_usd:+.2f} "
+                    f"| prox={t['prox']:.03f} touch#{t['touch#']}")
+
+            messagebox.showinfo(
+                "Sim complete",
+                f"Trades: {len(trades)} | Wins: {wins} Loss: {loss} Open: {openx}\n"
+                f"Total R: {total_R} | Avg R (closed): {avg_R}\n"
+                f"Max Profit: ${max_profit_usd} | Max Loss: ${max_loss_usd}\n"
+                f"Max Win (R): {max_win_R} | Max Loss (R): {max_loss_R}"
+            )
+
+        except Exception as e:
+            audit(self.conn, "SIM", "ERROR", str(e))
+            try:
+                messagebox.showerror("Sim error", str(e))
+            except Exception:
+                pass
+            import traceback
+            audit(self.conn, "SIM", "ERROR_TRACE", traceback.format_exc())
+            return
 
     # ---------- Test Price & Pings ----------
     def _test_price(self):
@@ -2234,13 +3750,89 @@ class QMMXApp(tk.Tk):
         t = threading.Thread(target=loop, daemon=True)
         t.start()
 
+    def _retrain_from_labeled_events(self, max_rows: int = 500):
+        """
+        Incrementally update OnlinePolicy from policy_events that have a label
+        and have not been trained yet (tracked via settings key 'last_trained_policy_event_id').
+        """
+        last_id = int(settings_get(self.conn, "last_trained_policy_event_id", "0") or 0)
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, phase, action, features_json, label
+            FROM policy_events
+            WHERE label IS NOT NULL
+            AND id > ?
+            ORDER BY id ASC
+            LIMIT ?
+        """, (last_id, max_rows))
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        trained_up_to = last_id
+        n_updates = 0
+        for _id, phase, action, fjson, label in rows:
+            try:
+                feats = json.loads(fjson or "{}")
+                # Build exactly the same feature vector the model expects:
+                x = self.policy.build_features(
+                    proximity_abs=float(feats.get("proximity_abs", 0.0)),
+                    volume_trend=float(feats.get("volume_trend", 0.0)),
+                    approach=str(feats.get("approach", "from_above")),
+                    confluence=bool(feats.get("confluence", False)),
+                    minutes_since_open=int(feats.get("minutes_since_open", 0))
+                )
+                y = int(label)
+                if phase == "entry":
+                    # Map to the action actually taken at the time
+                    a = action if action in ("go_long","go_short","skip") else "skip"
+                    self.policy.update_entry(x, a, y)
+                    n_updates += 1
+                elif phase == "exit":
+                    a = action if action in ("exit_now","hold") else "hold"
+                    self.policy.update_exit(x, a, y)
+                    n_updates += 1
+                trained_up_to = _id
+            except Exception as e:
+                self._log_ui("POLICY", "TRAIN_ERR", f"policy_event {_id} failed: {e}")
+
+        # Persist watermark + save model snapshot
+        settings_set(self.conn, "last_trained_policy_event_id", str(trained_up_to))
+        self._save_policy()
+        self._log_ui("POLICY", "TRAIN", f"Updated from {n_updates} events; watermark → {trained_up_to}")
+        return n_updates
+    
+    def _auto_tune_conf_threshold(self, window: int = 200):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT label FROM policy_events
+            WHERE phase='entry' AND label IS NOT NULL
+            ORDER BY id DESC LIMIT ?
+        """, (window,))
+        labels = [r[0] for r in cur.fetchall()]
+        if len(labels) < 30:
+            return
+        winrate = sum(1 for x in labels if int(x)==1) / len(labels)
+        # Nudge threshold toward winrate with mild inertia
+        cur_thr = float(settings_get(self.conn, "Q_MIN_PROB", "0.60") or 0.60)
+        target  = min(0.70, max(0.45, winrate))  # clamp
+        new_thr = 0.8 * cur_thr + 0.2 * target
+        settings_set(self.conn, "Q_MIN_PROB", f"{new_thr:.2f}")
+        self._log_ui("POLICY", "TUNE", f"Winrate={winrate:.2f} → Q_MIN_PROB {cur_thr:.2f}→{new_thr:.2f}")
+
+    def _start_retrain_scheduler(self):
+        # already mentioned in your init; here’s the body
+        try:
+            self._retrain_from_labeled_events(max_rows=1000)
+        finally:
+            self.after(2 * 60 * 1000, self._start_retrain_scheduler)
+
     def _retrain_now(self):
         self._do_retrain()
 
     def _do_retrain(self):
         if not SKLEARN_OK:
             self._log_ui("RETRAIN", "SKLEARN_MISSING", "scikit-learn not installed; cannot retrain.")
-            return
         try:
             X, y = self._build_training_data()
             if len(X) < 50:
